@@ -1,0 +1,1244 @@
+
+```{r}
+MSdata <- read.csv("/Users/chengyi/Desktop/drivers/MS\ Driving.csv", header = TRUE) # my path
+MSdata.37 <- MSdata[-2,] # delete obs without response
+#add pass fail column
+test <- as.factor(MSdata.37[,"GRS.2X.CDRS"]==1)
+levels(test)[1] <- 0 #pass
+levels(test)[2] <- 1 #fail
+MSdata.37$Test <- test
+#pull test scores out
+input <- MSdata.37[,c("cwt","jlo","cvtt","cvtd","bvtt","bvtd","sdo","rp3","rp2","cccs","ccds","scw")]
+driver <- cbind(test, input)
+# dataframe containning hypothsized useful variables
+driver_lo <- driver[c(1,6,8,10,12)]
+# dataframe containning 11 varaibes (no scw)
+driver_scw <- driver[,-13]
+# dataframe with 36 obs
+driver_36 <- driver[-22,]
+k <- c(5,10,37) # CV fold
+k36 <- c(5,10,36)
+seed <- 45 
+see <- seq(100,300,10) 
+see_red <- seq(100,300,50) 
+```
+# Detect Correlation
+```{r}
+library(dplyr)
+library(reshape2)
+cors <- as.matrix(cor(driver_36[,-1]))
+rs <- arrange(melt(cors), -abs(value))
+topcor <- dplyr::filter(rs, value > 0.7) # throw away: cvtd, bvtd, rp3, cccs, scw
+driver_cor <- driver[,-c(5,7,9,11,13)]
+```
+# Boxplot
+```{r,results="asis", echo=FALSE, warning=FALSE,message=FALSE}
+library(ggplot2)
+library(reshape2)
+data.melt <- melt(driver_36,id.var="test")
+ggplot(data.melt,aes(x=variable,y=value)) +
+  geom_boxplot(aes(fill=test),alpha=0.7, outlier.colour = "black",outlier.size=2) +
+  ylab("Test Score") +
+  xlab("Cognitive Test") +
+  scale_fill_discrete(name="Drive Test Result",breaks=c("0","1"),labels=c("Pass","Fail")) + 
+  theme(axis.text=element_text(size=10),axis.title.x=element_text(size=15))
+```
+# Use Welch’s t-test & two-sample Wilcoxon test
+```{r}
+library(xtable)
+x <- c(2:13)
+w.test <- lapply(x,FUN=function(k){wilcox.test(driver_36[,k]~driver_36[,1],alternative="two.sided")})
+pval.w <- sapply(1:12,FUN=function(k){w.test[[k]]$p.value})
+test.names <- c("cwt","jlo","cvtt","cvtd","bvtt","bvtd","sdo","rp3","rp2","cccs","ccds","scw")
+t.table <- as.data.frame(cbind(test.names, round(pval.w,4)))
+names(t.table) <- c("Test", "Wilcoxon test p-value")
+x.t.table <- xtable(t.table,caption="Wilcoxon test for MACFIMS test score difference.")
+print(x.t.table,include.rownames=FALSE,table.placement="H") 
+```
+# Unsupervised clustering + MDS plot
+```{r}
+# K-means
+set.seed(seed)
+dr.km3 <- kmeans(driver_scw, 3, nstart = 200)
+driver_scw$cluster <- as.factor(dr.km3$cluster)
+library(ggplot2)
+kmplot <- ggplot(driver_scw, aes(cwt, bvtt, color = cluster)) + 
+  geom_point() + 
+  ggtitle("K-means") + 
+  scale_color_manual(values=c("red","green","blue"), breaks=c("1","2","3"), labels=c("class_1","class_2","class_3"))
+
+realplot <- ggplot(driver_scw, aes(cwt, bvtt, color = test)) + 
+  geom_point() + 
+  ggtitle("Real Labels")+
+  scale_color_manual(values = c(1,2), breaks=c("0","1"),labels=c("Pass","Fail"))
+library(gridExtra)
+grid.arrange(kmplot, realplot, ncol=2)
+
+# PCA 
+log.dr <- driver_cor[,-1]
+dr.test <- driver_cor[,1]
+dr.pca <- prcomp(log.dr, center = TRUE, scale. = TRUE)
+print(dr.pca)
+plot(dr.pca, type="l")
+summary(dr.pca)
+library(ggbiplot)
+dr <- ggbiplot(dr.pca, obs.scale = 1, var.scale = 1, group = dr.test,
+               ellipse = TRUE, circle = TRUE) +
+  scale_color_discrete(name = '') +
+  theme(legend.direction = 'horizontal', legend.position = 'top')
+print(dr)
+dr.pca$rotation
+
+# MDSplot
+par(mfrow=c(1,1))
+ori_mds <- plot(cmdscale(dist(driver_cor[,-1])),     # use euclidean distance
+     col = as.integer(driver_cor[,1]), pch=20,
+     main="MDSplot for real data", xlab = "Dim 1", ylab= "Dim 2",cex=1)
+legend("bottomright", pch = 20, col = c(1,2), legend = c("Pass","Fail"), cex = 0.5)
+# Not an obvious separate.
+```
+
+CV functions
+```{r}
+# functions for LOOCV confusion tables
+ CVError_logi_loo <- function(daTa, K, seed, cf){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.pre <- numeric(K)
+  for (k in 1:K) {
+    fit <- glm(test~ bvtt + sdo + rp2 + ccds + bvtt:rp2 + bvtt:ccds + sdo:rp2 + 
+    sdo:ccds + rp2:ccds + sdo:rp2:ccds, family = binomial, data = daTa[-index[[k]],])
+    pred <- ifelse(predict(fit, newdata = daTa[index[[k]],], type="response") > cf, 1, 0)
+    all.pre[k] <- pred
+  }
+  all.pre
+ }
+ CVError_tree_loo <- function(daTa, K){
+  library(caret)
+  index <- createFolds(daTa$test, k = K)
+  all.pre <- numeric(K)
+  for (k in 1:K) {
+    library(C50)
+    fit <- C5.0(test~., data=daTa[-index[[k]],])
+    pred <- predict.C5.0(fit, newdata = daTa[index[[k]],])
+    pred <- ifelse(pred == 0, 0, 1)
+    all.pre[k] <- pred
+  }
+  all.pre
+ }
+ CVError_bag_loo <- function(daTa, K, nbag){
+  library(caret)
+  index <- createFolds(daTa$test, k = K)
+  all.pre <- numeric(K)
+  for (k in 1:K) {
+    library(ipred)
+    fit <- bagging(test~., data=daTa[-index[[k]],], nbagg = nbag)
+    pred <- predict(fit, newdata = daTa[index[[k]],])
+    pred <- ifelse(pred == 0, 0, 1)
+    all.pre[k] <- pred
+  }
+  all.pre
+ }
+ CVError_rf_loo <- function(daTa, K){
+  library(caret)
+  index <- createFolds(daTa$test, k = K)
+  all.pre <- numeric(K)
+  for (k in 1:K) {
+    library(e1071)
+    library(randomForest)
+    fit <- best.randomForest(test~., data=daTa[-index[[k]],], mtry = c(1:2), ntree = 100*seq(5,10,1))
+    pred <- predict(fit, newdata = daTa[index[[k]],])
+    pred <- ifelse(pred == 0, 0, 1)
+    all.pre[k] <- pred
+  }
+  all.pre
+ }
+ CVError_svm_loo <- function(daTa, K){
+  library(caret)
+  index <- createFolds(daTa$test, k = K)
+  all.pre <- numeric(K)
+  for (k in 1:K) {
+    library(e1071)
+    fit <- svm(test~., data=daTa[-index[[k]],], scale=TRUE, kernel="radial", 
+                    gamma =3.051758e-05, cost = 0.03125)
+    pred <- predict(fit, newdata = daTa[index[[k]],])
+    pred <- ifelse(pred == 0, 0, 1)
+    all.pre[k] <- pred
+  }
+  all.pre
+ }
+ CVError_wsvm_loo <- function(daTa, K, seed){
+  library(caret)
+  index <- createFolds(daTa$test, k = K, seed)
+  all.pre <- numeric(K)
+  library(e1071)
+  set.seed(seed)
+  fit.o <- best.svm(test~., data=daTa, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), 
+                    class.weights= c("0" = 1, "1" = 3))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  library(e1071)
+  for (k in 1:K) {
+  fit <- svm(test~., data = daTa[-index[[k]],],scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co,
+                  class.weights= c("0" = 1, "1" = 3))
+  pred <- predict(fit, newdata = daTa[index[[k]],])
+  pred <- ifelse(pred == 0, 0, 1)
+  all.pre[k] <- pred
+  }
+  all.pre
+}
+# SVM_stratified CV error, weighted
+CVError_svm_w <- function(daTa, K, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.err <- numeric(K)
+  library(e1071)
+  set.seed(seed)
+  fit.o <- best.svm(test~., data=daTa, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), 
+                    class.weights= c("0" = 1, "1" = 3))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  library(e1071)
+  for (k in 1:K) {
+  fit <- svm(test~., data = daTa[-index[[k]],],scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co,
+                  class.weights= c("0" = 1, "1" = 3))
+  pred <- predict(fit, daTa[index[[k]],])
+  pred <- as.factor(pred)
+  levels(pred) <- c("0","1")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  cm <- table(pred, true)
+  err <- 1-(cm[1,1]+cm[2,2])/sum(cm)
+  all.err[k] <- err
+  }
+  mean(all.err)
+}
+CVError_svm <- function(daTa, K, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.err <- numeric(K)
+  library(e1071)
+  set.seed(seed)
+  fit.o <- best.svm(test~., data=daTa, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  library(e1071)
+  for (k in 1:K) {
+  fit <- svm(test~., data = daTa[-index[[k]],],scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co)
+  pred <- predict(fit, daTa[index[[k]],])
+  pred <- as.factor(pred)
+  levels(pred) <- c("0","1")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  cm <- table(pred, true)
+  err <- 1-(cm[1,1]+cm[2,2])/sum(cm)
+  all.err[k] <- err
+  }
+  mean(all.err)
+}
+CVError_svm_s <- function(daTa, K, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.err <- numeric(K)
+  library(DMwR)
+  newdata <- SMOTE(test ~ ., daTa, perc.over = 200)
+  library(e1071)
+  set.seed(seed)
+  fit.o <- best.svm(test~., data=newdata, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  for (k in 1:K) {
+  library(DMwR)
+  newdatak <- SMOTE(test ~ ., daTa[-index[[k]],], perc.over = 200)
+  library(e1071)
+  fit <- svm(test~., data = newdatak, scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co)
+  pred <- predict(fit, daTa[index[[k]],])
+  pred <- as.factor(pred)
+  levels(pred) <- c("0","1")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  cm <- table(pred, true)
+  err <- 1-(cm[1,1]+cm[2,2])/sum(cm)
+  all.err[k] <- err
+  }
+  mean(all.err)
+}
+
+# SVM_AVG testing AUC, k=5
+CVAUC_svm_w <- function(daTa, K=5, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  library(e1071)
+  fit.o <- best.svm(test~., data=daTa, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), 
+                    class.weights= c("0" = 1, "1" = 3))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  all.auc <- numeric(K)
+  library(e1071)
+  for (k in 1:K) {
+  fit <- svm(test~., data = daTa[-index[[k]],],scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co, probability = TRUE,
+                  class.weights= c("0" = 1, "1" = 3))
+  pred <- predict(fit, daTa[index[[k]],], probability = TRUE, decision.values = TRUE)
+  psvm <- attr(pred, "decision.values")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.svm <- roc(true~as.vector(psvm), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+CVAUC_svm <- function(daTa, K=5, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  library(e1071)
+  fit.o <- best.svm(test~., data=daTa, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  all.auc <- numeric(K)
+  library(e1071)
+  for (k in 1:K) {
+  fit <- svm(test~., data = daTa[-index[[k]],],scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co, probability = TRUE)
+  pred <- predict(fit, daTa[index[[k]],], probability = TRUE, decision.values = TRUE)
+  psvm <- attr(pred, "decision.values")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.svm <- roc(true~as.vector(psvm), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+CVAUC_svm_s <- function(daTa, K=5, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  library(DMwR)
+  newdata <- SMOTE(test ~ ., daTa, perc.over = 200)
+  library(e1071)
+  fit.o <- best.svm(test~., data=newdata, scale=TRUE, kernel="radial",
+                    gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)))
+  ga <- fit.o$gamma
+  co <- fit.o$cost
+  all.auc <- numeric(K)
+  for (k in 1:K) {
+    library(DMwR)
+    newdatak <- SMOTE(test ~ ., daTa[-index[[k]],], perc.over = 200)
+    library(e1071)
+    fit <- svm(test~., data = newdatak, scale=TRUE, kernel="radial",
+                  gamma = ga, cost = co)
+  pred <- predict(fit, daTa[index[[k]],], probability = TRUE, decision.values = TRUE)
+  psvm <- attr(pred, "decision.values")
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.svm <- roc(true~as.vector(psvm), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+# RF_AVG testing AUC, k=5
+CVAUC_rf <- function(daTa, K=5, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  vari <- ncol(daTa) - 1
+  library(e1071)
+  fit.o <- best.randomForest(test~., data = daTa, 
+                             mtry = c(1:vari), ntree = 100*seq(5,15,1))
+  m <- fit.o$mtry
+  n <- fit.o$ntree
+  all.auc <- numeric(K)
+  library(randomForest)
+  for (k in 1:K) {
+  fit <- randomForest(test~., data = daTa[-index[[k]],], mtry = m, ntree = n)
+  prf <- predict(fit, daTa[index[[k]],], type = "prob")[,2]
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.rf <- roc(true~as.vector(prf), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+# Tree_AVG testing AUC, k=5
+CVAUC_tree <- function(daTa, K=5, seed){
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.auc <- numeric(K)
+  library(C50)
+  for (k in 1:K) {
+  fit <- C5.0(test~., data = daTa[-index[[k]],], method = "class")
+  prf <- predict(fit, daTa[index[[k]],], type = "prob")[,2]
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.tree <- roc(true~as.vector(prf), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+# Bag_AVG testing AUC, k=5
+CVAUC_bag <- function(daTa, K=5, t, seed) {
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.auc <- numeric(K)
+  library(ipred)
+  for (k in 1:K) {
+  fit <- bagging(test~., data = daTa[-index[[k]],], nbagg = t, coob = FALSE)
+  pbag <- predict(fit, daTa[index[[k]],], type = "prob")[,2]
+  true <- as.factor(daTa$test[index[[k]]])
+  levels(true) <- c("0","1")
+  library(pROC)
+  all.auc[k] <- auc(roc.bag <- roc(true~as.vector(pbag), smooth = FALSE))
+  }
+  mean(all.auc)
+}
+# Logit_AVG testing AUC, k=5
+CVAUC_logi <- function(daTa, K=5, seed) {
+  library(caret)
+  set.seed(seed)
+  index <- createFolds(daTa$test, k = K)
+  all.auc <- numeric(K)
+  for (k in 1:K) {
+  fit <- glm(test~ bvtt + sdo + rp2 + ccds + bvtt:rp2 + bvtt:ccds + sdo:rp2 +
+               sdo:ccds + rp2:ccds + sdo:rp2:ccds, family = binomial, data = daTa[-index[[k]],])
+  library(ROCR)
+  prob.main <- predict(fit, newdata= daTa[index[[k]],], type="response")
+  pred.main <- prediction(prob.main, daTa$test[index[[k]]])
+  perf.main <- performance(pred.main, measure = "tpr", x.measure = "fpr")
+  all.auc[k] <- performance(pred.main, measure = "auc")@y.values[[1]]
+  }
+  mean(1-all.auc)
+}
+```
+# Redo logistic (find useful variables & model prediction power)
+```{r}
+# show model with 36 obs does not contain scw
+library(lattice)
+library(DAAG)
+full <- glm(test~.,data = driver_36, family=binomial)
+plot(vif(full))
+full.red <- glm(test~.-cvtt - bvtd-rp3-cccs, data=driver_36, family = binomial)
+# plot(vif(full.red))
+step.aic <- step(full.red, direction="backward", trace=0)
+step.bic <- step(full.red, k=log(nrow(driver)), trace=0)  # 2 model are same: bvtt + intercept
+main <- glm(test~(bvtt + sdo + rp2 + ccds)^3, data = driver_36, family = binomial)
+step.main.aic <- step(main, trace = 0)
+step.main.bic <- step(main, k=log(nrow(driver)), trace=0)
+anova(step.main.aic, step.main.bic, test = "LRT") # equal, dont contain scw.
+
+# fit 37 obs without scw
+full.red_37 <- glm(test~.-cvtt-bvtd-rp3-cccs-scw, data = driver, family = binomial)
+# plot(vif(full.red_37))
+step.aic_37 <- step(full.red_37, direction="backward", trace=0) # cvtd + bvtt + intercept
+step.bic_37 <- step(full.red_37, k=log(nrow(driver)), trace=0)  # bvtt + intercept
+
+main_37 <- glm(test~(bvtt + sdo + rp2 + ccds)^3, data = driver, family = binomial)
+step.main.aic_37 <- step(main, trace = 0)
+step.main.bic_37 <- step(main, k=log(nrow(driver)), trace=0)
+anova(step.main.aic, step.main.bic, test = "LRT") 
+modfinal <- step.main.aic_37
+
+# training AUC
+library(ROCR)
+prob.main <- predict(modfinal, newdata = driver, type="response")
+pred.main <- prediction(prob.main, driver[,1])
+perf.main <- performance(pred.main, measure = "tpr", x.measure = "fpr")
+plot(perf.main)
+performance(pred.main, measure = "auc")@y.values[[1]]
+# Misclassification
+cutoff <- 0.2716994
+pre <- ifelse(predict(modfinal, newdata= driver, type="response") >= cutoff, 1,0)
+table(pre, driver$test)
+# Testing Accuracy
+library(caret)
+library(caTools)
+y <- driver_scw$test
+CV_Folds5 <- createMultiFolds(y, k = 5, times = 5)
+CV_Folds10 <- createMultiFolds(y, k = 10, times = 5)
+set.seed(seed)
+logi_m5 <- train(test ~ bvtt + sdo + rp2 + ccds + bvtt:rp2 + bvtt:ccds + 
+    sdo:rp2 + sdo:ccds + rp2:ccds + sdo:rp2:ccds, data = driver_scw, method="glm", family = "binomial", tuneLength=10, 
+    trControl = trainControl(method='repeatedcv', index=CV_Folds5))
+logi_m5  
+set.seed(seed)
+logi_m10 <- train(test ~ bvtt + sdo + rp2 + ccds + bvtt:rp2 + bvtt:ccds + 
+    sdo:rp2 + sdo:ccds + rp2:ccds + sdo:rp2:ccds, data = driver_scw, method="glm", family = "binomial", tuneLength=10, 
+    trControl = trainControl(method='repeatedcv', index=CV_Folds10))
+logi_m10 
+set.seed(seed)
+logi_mloo <- train(test ~ bvtt + sdo + rp2 + ccds + bvtt:rp2 + bvtt:ccds + 
+    sdo:rp2 + sdo:ccds + rp2:ccds + sdo:rp2:ccds, data = driver_scw, method="glm", family = "binomial", tuneLength=10, 
+    trControl = trainControl(method='LOOCV', repeats = 5))
+logi_mloo
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_logi(driver_scw, 5, s)))
+# Confusion matrix from LOO
+pre_logi_loo <- CVError_logi_loo(driver_scw, 37, 840, 0.5)
+table(as.factor(pre_logi_loo), driver_scw$test)
+```
+# Tree(C50)
+```{r}
+# 36 obs, 12 variables
+library(C50)
+tree_36 <- C5.0(test~.,data=driver_36)
+plot(tree_36)  # there is no scw
+# 37 obs, 11 variables
+library(C50)
+tree <- C5.0(test~.-scw,data=driver)
+summary(tree)
+# CV error
+c50Grid <- expand.grid(.trials = c(1:9),.model = "tree",.winnow = FALSE)
+set.seed(seed)
+train(driver_scw[,-1],y, method="C5.0", tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds5))
+set.seed(seed)
+train(driver_scw[,-1],y, method="C5.0", tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds10))
+set.seed(seed)
+train(driver_scw[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='LOOCV', repeats = 5))
+# training AUC
+library(pROC)
+tree.pred <- predict.C5.0(tree, driver, type = "prob")[,2]
+comtree <- cbind(as.numeric(driver[,1])-1,tree.pred)
+colnames(comtree) <- c("test","response")
+roc.tree <- roc(test~response, data= comtree, smooth=FALSE)
+auc(roc.tree)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_tree(driver_scw, 5, s)))
+# Confusion matrix from LOO
+pre_tree_loo11 <- CVError_tree_loo(driver_scw, 37)
+table(as.factor(pre_tree_loo11), driver_scw$test) 
+
+# 37obs, 7 variables
+set.seed(seed)
+tree_cor <- C5.0(test~., data = driver_cor)
+summary(tree_cor)
+plot(tree_cor) 
+# CV error
+set.seed(seed)
+train(driver_cor[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds5))
+set.seed(seed)
+train(driver_cor[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds10))
+set.seed(seed)
+train(driver_cor[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='LOOCV', repeats = 5))
+# training AUC
+library(pROC)
+tree.pred <- predict.C5.0(tree_cor, driver, type = "prob")[,2]
+comtree <- cbind(as.numeric(driver[,1])-1,tree.pred)
+colnames(comtree) <- c("test","response")
+roc.tree <- roc(test~response, data= comtree, smooth=FALSE)
+auc(roc.tree)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_tree(driver_cor, 5, s)))
+# Confusion matrix from LOO
+pre_tree_loo7 <- CVError_tree_loo(driver_cor, 37)
+table(as.factor(pre_tree_loo7), driver_cor$test) 
+
+# 37 obs, 4 variables
+library(C50)
+tree_vs <- C5.0(test~.,data=driver_lo)
+summary(tree_vs)
+plot(tree_vs)
+# CV
+set.seed(seed)
+train(driver_lo[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds5))
+set.seed(seed)
+train(driver_lo[,-1],y, method="C5.0",tuneGrid = c50Grid,
+                 trControl = trainControl(method='repeatedcv', index=CV_Folds10))
+set.seed(seed)
+train(driver_lo[,-1],y, method="C5.0", tuneGrid = c50Grid,
+                 trControl = trainControl(method='LOOCV', repeats = 5))
+# training AUC
+library(pROC)
+tree.pred_vs <- predict.C5.0(tree_vs, driver_lo, type = "prob")[,2]
+comtree_vs <- cbind(as.numeric(driver_lo[,1])-1,tree.pred_vs)
+colnames(comtree_vs) <- c("test","response")
+roc.tree_vs <- roc(test~response, data= comtree_vs, smooth=FALSE)
+auc(roc.tree_vs) 
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_tree(driver_lo, 5, s)))
+# Confusion matrix from LOO
+pre_tree_loo4 <- CVError_tree_loo(driver_lo, 37)
+table(as.factor(pre_tree_loo4), driver_lo$test) 
+
+```
+```{r}
+va11 <- c(1.0000, 0.5898, 0.0000, 0.3171, 0.3067, 0.2703)
+va7 <- c(1.0000, 0.6052, 0.0000, 0.3195, 0.2900, 0.3514)
+va4 <- c(0.9138, 0.5852, 0.1081, 0.2586, 0.2650, 0.2432)
+summary_tree <- matrix(c(va11, va7, va4), ncol= 3, byrow = FALSE, dimnames = list(c("Training AUC","Testing AUC", "Misclassification Rate","K=5","K=10","LOOCV"),c("11 variables","7 variables","4 variables")))
+library(xtable)
+summary_tree <- as.data.frame(summary_tree)
+x.summary_tree <- xtable(summary_tree, caption = "Performance summary for tree model", digits = 4, align = c("c","c","c","c"))
+print(x.summary_tree,table.placement="H")
+```
+# Bagging
+```{r}
+library(ipred)
+# 12 variables 36 obs
+err_36 <- double(90) # tune parameter
+for(n in 11:100){
+  set.seed(3)
+  bag.fit <- bagging(test~., data = driver_36, nbagg = 2*n, coob=TRUE)
+  err_36[n-10] <- bag.fit$err
+}
+plot(2*(11:100), err_36, type="b", xlab="nbagg", ylab="OOB Error",main="All Variables 36 obs")
+# take n = 24
+set.seed(seed)
+ip_36 <- bagging(test~., data = driver_36, coob =TRUE, nbagg=24)
+# Misclassification rate
+table(predict(ip_36, driver_36), driver_36$test)
+# training AUC
+ip.prob <- predict(ip_36, driver_36, type = "prob")
+ip_36.rocr <- prediction(ip.prob[,2], driver_36$test)
+ip_36.perf <- performance(ip_36.rocr, "tpr","fpr")
+performance(ip_36.rocr, measure = "auc")@y.values
+# CV error
+set.seed(seed)
+bag_m5 <- train(driver_36[,-1],driver_36[,1], method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-bag_m5$results[2] 
+set.seed(seed)
+bag_m10 <- train(driver_36[,-1],driver_36[,1], method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-bag_m10$results[2]
+set.seed(seed)
+bag_mloo <- train(driver_36[,-1],driver_36[,1], method="treebag", tuneLength = 5,
+                trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-bag_mloo$results[2]
+# testing AUC
+mean(sapply(see_red, FUN = function(s) CVAUC_bag(driver_36, 5, 24, s)))
+# Confusion matrix from LOO
+pre_bag_loo12 <- CVError_bag_loo(driver_36, 36, 24)
+table(as.factor(pre_bag_loo12), driver_36$test) 
+
+# 11 variables 37 obs
+err_37 <- double(90)
+for(n in 11:100){
+  set.seed(seed)
+  bag.fit <- bagging(test~., data = driver_scw, nbagg = 2*n, coob=TRUE)
+  err_37[n-10] <- bag.fit$err
+}
+plot(2*(11:100), err_37, type="b", xlab="nbagg", ylab="OOB Error",main="11 Variables 37 obs")
+# take n = 50
+set.seed(seed)
+ip_scw <- bagging(test~., data = driver_scw, coob =TRUE, nbagg = 50)
+# Misclassification rate
+table(predict(ip_scw, driver_scw), driver_scw$test)
+# training AUC
+ip_scw.prob <- predict(ip_scw, driver_scw, type = "prob")
+ip_scw.rocr <- prediction(ip_scw.prob[,2], driver_scw$test)
+ip_scw.perf <- performance(ip_scw.rocr, "tpr","fpr")
+performance(ip_scw.rocr, measure = "auc")@y.values  # auc = 1 
+# CV error
+set.seed(seed-2)
+bag.scw_m5 <- train(driver_scw[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-bag.scw_m5$results[2]
+set.seed(seed-2)
+bag.scw_m10 <- train(driver_scw[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-bag.scw_m10$results[2]
+set.seed(seed-2)
+bag.scw_mloo <- train(driver_scw[,-1], y, method="treebag", tuneLength = 10,
+                trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-bag.scw_mloo$results[2]
+# testing AUC
+mean(sapply(c(50, 40, 130, 100, 203), FUN = function(s) CVAUC_bag(driver_scw, 5, 50, s)))
+# Confusion matrix from LOO
+pre_bag_loo11 <- CVError_bag_loo(driver_scw, 37, 50)
+table(as.factor(pre_bag_loo11), driver_scw$test) 
+
+# 7 vairalbes
+err_cor <- double(90)
+for(n in 11:100){
+  set.seed(seed)
+  bag.fit <- bagging(test~., data = driver_cor, nbagg = 2*n, coob=TRUE)
+  err_cor[n-10] <- bag.fit$err
+}
+plot(2*(11:100), err_cor, type="b", xlab="nbagg", ylab="OOB Error",main="7 Variables 37 obs")
+# take n = 46
+set.seed(seed)
+ip_cor <- bagging(test~., data = driver_cor, coob =TRUE, nbagg=46)
+# Misclassification rate
+table(predict(ip_cor, driver_cor), driver_cor$test)
+# training AUC
+ip_cor.prob <- predict(ip_cor, driver_cor, type = "prob")
+ip_cor.rocr <- prediction(ip_cor.prob[,2], driver_cor$test)
+ip_cor.perf <- performance(ip_cor.rocr, "tpr","fpr")
+performance(ip_cor.rocr, measure = "auc")@y.values
+# CV error
+set.seed(seed)
+bag.cor_m5 <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-bag.cor_m5$results[2]
+set.seed(seed)
+bag.cor_m10 <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-bag.cor_m10$results[2] 
+set.seed(seed)
+bag.cor_mloo <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-bag.cor_mloo$results[2] 
+# testing AUC
+mean(sapply(c(50, 220, 130, 180, 203), FUN = function(s) CVAUC_bag(driver_cor, 5, 46, s)))
+# Confusion matrix from LOO
+pre_bag_loo7 <- CVError_bag_loo(driver_cor, 37, 46)
+table(as.factor(pre_bag_loo7), driver_cor$test) 
+
+# 4 variables
+err_lo <- double(90)
+for(n in 11:100){
+  set.seed(seed)
+  bag.fit <- bagging(test~., data = driver_lo, nbagg = 2*n, coob=TRUE)
+  err_lo[n-10] <- bag.fit$err
+}
+plot(2*(11:100), err_cor, type="b", xlab="nbagg", ylab="OOB Error",main="4 Variables 37 obs")
+# take n = 54
+set.seed(seed)
+ip_lo <- bagging(test~., data = driver_lo, coob =TRUE, nbagg=54)
+# Misclassification rate
+table(predict(ip_lo, driver_lo), driver_lo$test)
+# training AUC
+ip_lo.prob <- predict(ip_lo, driver_lo, type = "prob")
+ip_lo.rocr <- prediction(ip_lo.prob[,2], driver_lo$test)
+ip_lo.perf <- performance(ip_lo.rocr, "tpr","fpr")
+performance(ip_lo.rocr, measure = "auc")@y.values  # auc = 1 
+plot(ip_lo.perf)
+# CV error
+set.seed(seed-1)
+bag.lo_m5 <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-bag.lo_m5$results[2]
+set.seed(seed-1)
+bag.lo_m10 <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-bag.lo_m10$results[2]
+set.seed(seed-1)
+bag.lo_mloo <- train(driver_cor[,-1], y, method="treebag", tuneLength = 5,
+                trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-bag.lo_mloo$results[2] 
+# testing AUC
+mean(sapply(c(50, 220, 130, 180, 203), FUN = function(s) CVAUC_bag(driver_lo, 5, 54, s)))
+# Confusion matrix from LOO
+pre_bag_loo4 <- CVError_bag_loo(driver_lo, 37, 54)
+table(as.factor(pre_bag_loo4), driver_lo$test)
+```
+```{r}
+va12_b <- c(1.0000,0.6313,0.0000,0.3204,0.3217,0.3333,0.3056)
+va11_b <- c(1.0000,0.6313,0.0000,0.3204,0.3217,0.3333,0.3056)
+va7_b <- c(1.0000, 0.6313,0.0000,0.3204,0.3217,0.3333,0.3056)
+va4_b <- c(1.0000, 0.6790,0.0000,0.3207,0.3214,0.3243,0.3243)
+summary_bag <- matrix(c(va12_b, va11_b, va7_b, va4_b), ncol= 4, byrow = FALSE, dimnames = list(c("Training AUC","Testing AUC", "Misclassification Rate","K=5","K=10","LOOCV","OOB"), c("12 variables","11 variables","7 variables","4 variables")))
+library(xtable)
+summary_bag <- as.data.frame(summary_bag)
+x.summary_bag <- xtable(summary_bag, caption = "Performance summary for tree bagging", digits = 4, align = c("c","c","c","c","c"))
+print(x.summary_bag,table.placement="H")
+```
+# RF
+```{r}
+# 36 obs 12 variables
+library(e1071)
+library(randomForest)
+set.seed(seed+50)
+rf_36 <- best.randomForest(test~., data = driver_36, mtry = c(1:3), 
+                           ntree = 100*seq(5,10,1), proximity = TRUE)
+table(predict(rf_36, driver_36), driver_36$test)
+# CV error
+set.seed(seed)
+rf_m5 <- train(driver_36[,-1],driver_36[,1], method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-max(rf_m5$results[,2]) 
+set.seed(seed)
+rf_m10 <- train(driver_36[,-1],driver_36[,1], method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-max(rf_m10$results[,2])
+set.seed(seed)
+rf_mloo <- train(driver_36[,-1],driver_36[,1], method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-max(rf_mloo$results[,2]) 
+# training AUC
+prf_36 <- predict(rf_36, driver_36, type = "prob")[,2]
+library(pROC)
+roc.rf_36 <- roc(driver_36$test~prf_36, smooth = FALSE)
+auc(roc.rf_36)
+# testing AUC
+mean(sapply(see_red, FUN = function(s) CVAUC_rf(driver_36, 5, s)))
+# Confusion matrix from LOO
+pre_rf_loo12 <- CVError_rf_loo(driver_36, 36)
+table(as.factor(pre_rf_loo12), driver_36$test) 
+
+# 11 variables
+set.seed(seed)
+rf_37 <- best.randomForest(test~., data = driver_scw, mtry=c(1:11), 
+                           ntree=100*seq(5,15,1), proximity = TRUE)
+table(predict(rf_37, driver_scw), driver_scw$test) # mis = 0
+# CV error
+set.seed(seed)
+rf.scw_m5 <- train(driver_scw[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-max(rf.scw_m5$results[,2])
+set.seed(seed)
+rf.scw_m10 <- train(driver_scw[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-max(rf.scw_m10$results[,2])
+set.seed(seed)
+rf.scw_mloo <- train(driver_scw[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-max(rf.scw_mloo$results[,2]) 
+# training AUC
+prf_37 <- predict(rf_37, driver_scw, type = "prob")[,2]
+library(pROC)
+roc.rf_37 <- roc(driver_scw$test~prf_37, smooth = FALSE)
+auc(roc.rf_37)
+# testing AUC
+mean(sapply(see_red, FUN = function(s) CVAUC_rf(driver_scw, 5, s)))
+# Confusion matrix from LOO
+pre_rf_loo11 <- CVError_rf_loo(driver_scw, 37)
+table(as.factor(pre_rf_loo11), driver_scw$test)
+
+# 7 variables
+set.seed(seed)
+rf_cor <- best.randomForest(test~., data = driver_cor, mtry = c(1:7), 
+                            ntree = 100*seq(5,15,1), proximity = TRUE)
+table(predict(rf_cor, driver_cor), driver_cor$test)
+importance(rf_cor, type = 1) # cwt jlo cvtt bvtt sdo rp2 ccds
+# CV error
+set.seed(seed)
+rf.cor_m5 <- train(driver_cor[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-max(rf.cor_m5$results[,2]) 
+set.seed(seed)
+rf.cor_m10 <- train(driver_cor[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-max(rf.cor_m10$results[,2]) 
+set.seed(seed)
+rf.cor_mloo <- train(driver_cor[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-max(rf.cor_mloo$results[,2])
+# training AUC
+prf_cor <- predict(rf_cor, driver_cor, type = "prob")[,2]
+library(pROC)
+roc.rf_cor <- roc(driver_cor$test~prf_cor, smooth = FALSE)
+auc(roc.rf_cor) 
+# testing AUC
+mean(sapply(see_red, FUN = function(s) CVAUC_rf(driver_cor, 5, s)))
+# Confusion matrix from LOO
+pre_rf_loo7 <- CVError_rf_loo(driver_cor, 37)
+table(as.factor(pre_rf_loo7), driver_cor$test)
+
+# 4 variables
+set.seed(seed)
+rf_lo <- best.randomForest(test~., data = driver_lo, mtry = c(1:4), 
+                           ntree = 100*seq(5,15,1), proximity = TRUE)
+table(predict(rf_lo, driver_lo), driver_lo$test)
+# CV error
+set.seed(seed)
+rf.lo_m5 <- train(driver_lo[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds5)) 
+1-max(rf.lo_m5$results[,2]) # err = 0.2804762
+set.seed(seed)
+rf.lo_m10 <- train(driver_lo[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='repeatedcv', index=CV_Folds10)) 
+1-max(rf.lo_m10$results[,2])
+set.seed(seed)
+rf.lo_mloo <- train(driver_lo[,-1], y, method="rf", tuneLength = 11,
+               preProc = c("center", "scale"),
+               trControl = trainControl(method='LOOCV', repeats = 5)) 
+1-max(rf.lo_mloo$results[,2])
+# training AUC
+prf_lo <- predict(rf_lo, driver_lo, type = "prob")[,2]
+library(pROC)
+roc.rf_lo <- roc(driver_lo$test~prf_lo, smooth = FALSE)
+auc(roc.rf_lo)
+# testing AUC
+mean(sapply(see_red, FUN = function(s) CVAUC_rf(driver_lo, 5, s)))
+# Confusion matrix from LOO
+pre_rf_loo4 <- CVError_rf_loo(driver_lo, 37)
+table(as.factor(pre_rf_loo4), driver_lo$test)
+```
+```{r}
+# use proximity to get MDSplots
+par(mfrow=c(1,3))
+MDSplot(rf_37, driver_scw$test, k=2, palette = c(2,4), main = "MDS plot_model with 11 variables")
+legend("topright", pch = 20, col = c(2,4), legend = c("Pass","Fail"), cex = 1)
+MDSplot(rf_cor, driver_cor$test, k=2, palette = c(2,4), main = "MDS plot_model with 7 variables")
+legend("topright", pch = 20, col = c(2,4), legend = c("Pass","Fail"), cex = 1)
+MDSplot(rf_lo, driver_lo$test, k=2, palette = c(2,4), main = "MDS plot_model with 4 variables")
+legend("topright", pch = 20, col = c(2,4), legend = c("Pass","Fail"), cex = 1)
+```
+```{r}
+va12_rf <- c(1.0000,0.6957,0.0000,0.3143,0.3667,0.3143,0.2778)
+va11_rf <- c(1.0000,0.7167,0.0000,0.2598,0.2583,0.2703,0.2432)
+va7_rf <- c(1.0000, 0.7067,0.0000,0.2293,0.2200,0.2162,0.2162)
+va4_rf <- c(1.0000, 0.7063,0.0000,0.2805,0.2833,0.2973,0.2703)
+summary_rf <- matrix(c(va12_rf, va11_rf, va7_rf, va4_rf), ncol= 4, byrow = FALSE, dimnames = list(c("Training AUC","Testing AUC", "Misclassification Rate","K=5","K=10","LOOCV","OOB"), c("12 variables","11 variables","7 variables","4 variables")))
+library(xtable)
+summary_rf <- as.data.frame(summary_rf)
+x.summary_rf <- xtable(summary_rf, caption = "Performance summary for random forest", digits = 4, align = c("c","c","c","c","c"))
+print(x.summary_rf,table.placement="H")
+
+```
+# SVM
+```{r}
+library(e1071)
+# 12 variables 36 obs
+set.seed(seed)
+svm_36 <- best.svm(test~., data = driver_36, scale=TRUE, kernel="radial",
+          gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)),probability = TRUE)
+table(predict(svm_36, driver_36), driver_36$test)
+# CV error
+set.seed(seed)
+svm_m5 <- train(driver_36[,-1], driver_36[,1], method="svmRadial", 
+                tuneLength=10, preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds5))
+1 - max(svm_m5$results[,3]) 
+set.seed(seed)
+svm_m10 <- train(driver_36[,-1], driver_36[,1], method="svmRadial", 
+                 tuneLength=10, preProc = c("center", "scale"),
+                 trControl=trainControl(method='repeatedcv', index=CV_Folds10))
+1 - max(svm_m10$results[,3]) 
+set.seed(seed)
+svm_mloo <- train(driver_36[,-1], driver_36[,1], method="svmRadial", 
+                  tuneLength=10, preProc = c("center", "scale"),
+                  trControl=trainControl(method='LOOCV', repeats = 5))
+1 - max(svm_mloo$results[,3])
+# training AUC
+psvm_36 <- attr(predict(svm_36, driver_36, probability = TRUE, 
+                        decision.values = TRUE), "decision.values")
+library(pROC)
+roc.svm_36 <- roc(yTe_36~as.vector(psvm_36), smooth = FALSE)
+auc(roc.svm_36)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_svm(driver_36, K=5, s)))
+# Confusion matrix from LOO
+pre_svm_loo12 <- CVError_svm_loo(driver_36, 36)
+table(as.factor(pre_svm_loo12), driver_36$test) 
+
+# 11 predictors 
+svm_37 <- best.svm(test~., data = driver_scw, scale=TRUE, kernel="radial",
+          gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), probability = TRUE)
+table(predict(svm_37, driver_scw), driver_scw$test)
+# CV errors
+set.seed(seed)
+svm.scw_m5 <- train(driver_scw[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds5))
+1 - max(svm.scw_m5$results[,3])
+set.seed(seed)
+svm.scw_m10 <- train(driver_scw[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds10))
+1 - max(svm.scw_m10$results[,3])
+set.seed(seed)
+svm.scw_mloo <- train(driver_scw[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='LOOCV', repeats = 5))
+1 - max(svm.scw_mloo$results[,3]) 
+# training AUC
+psvm_37 <- attr(predict(svm_37, driver_scw, probability = TRUE, 
+                        decision.values = TRUE), "decision.values")
+library(pROC)
+roc.svm_37 <- roc(yTe~as.vector(psvm_37), smooth = FALSE)
+auc(roc.svm_37)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_svm(driver_scw, K=5, s)))
+# Confusion matrix from LOO
+pre_svm_loo11 <- CVError_svm_loo(driver_scw, 37)
+table(as.factor(pre_svm_loo11), driver_scw$test)
+
+# 7 variables
+svm_cor <- best.svm(test~., data = driver_cor, scale=TRUE, kernel="radial",
+           gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), probability = TRUE)
+table(predict(svm_cor, driver_cor), driver_cor$test)
+# CV error
+set.seed(seed)
+svm.cor_m5 <- train(driver_cor[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds5))
+1 - max(svm.cor_m5$results[,3])
+set.seed(seed)
+svm.cor_m10 <- train(driver_cor[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds10))
+1 - max(svm.cor_m10$results[,3]) 
+set.seed(seed)
+svm.cor_mloo <- train(driver_cor[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='LOOCV', repeats = 5))
+1 - max(svm.cor_mloo$results[,3])
+# Training AUC
+psvm_cor <- attr(predict(svm_cor, driver_cor, probability = TRUE,
+                         decision.values = TRUE), "decision.values")
+library(pROC)
+roc.svm_cor <- roc(yTe_cor~as.vector(psvm_cor), smooth = FALSE)
+auc(roc.svm_cor)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_svm(driver_cor, K=5, s)))
+# Confusion matrix from LOO
+pre_svm_loo7 <- CVError_svm_loo(driver_cor, 37)
+table(as.factor(pre_svm_loo7), driver_cor$test)
+
+# 4 variables
+svm_lo <- best.svm(test~., data = driver_lo, scale=TRUE, kernel="radial",
+          gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)), probability = TRUE)
+table(predict(svm_lo, driver_lo), driver_lo$test)
+# CV error
+set.seed(seed)
+svm.lo_m5 <- train(driver_lo[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds5))
+1 - max(svm.lo_m5$results[,3])
+set.seed(seed)
+svm.lo_m10 <- train(driver_lo[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='repeatedcv', index=CV_Folds10))
+1 - max(svm.lo_m10$results[,3])
+set.seed(seed)
+svm.lo_mloo <- train(driver_lo[,-1], y, method="svmRadial", tuneLength=10,
+                preProc = c("center", "scale"),
+                trControl=trainControl(method='LOOCV', repeats = 5))
+1 - max(svm.lo_mloo$results[,3]) 
+# training AUC
+psvm_lo <- attr(predict(svm_lo, driver_lo, probability = TRUE, 
+                        decision.values = TRUE), "decision.values")
+library(pROC)
+roc.svm_lo <- roc(yTe_lo~as.vector(psvm_lo), smooth = FALSE)
+auc(roc.svm_lo)
+# testing AUC
+mean(sapply(see, FUN = function(s) CVAUC_svm(driver_lo, K=5, s)))
+# Confusion matrix from LOO
+pre_svm_loo4 <- CVError_svm_loo(driver_lo, 37)
+table(as.factor(pre_svm_loo4), driver_lo$test)
+
+```
+```{r}
+va12_svm <- c(0.5893,0.7214,0.2220,0.2250,0.2250,0.2222)
+va11_svm <- c(0.6466,0.7173,0.2162,0.2129,0.2083,0.2162)
+va7_svm <- c(0.6466, 0.7173,0.2162,0.2129,0.2083,0.2162)
+va4_svm <- c(0.5259,0.7108,0.2162,0.2129,0.2083,0.2162)
+summary_svm <- matrix(c(va12_svm, va11_svm, va7_svm, va4_svm), ncol= 4, byrow = FALSE, dimnames = list(c("Training AUC","Testing AUC", "Misclassification Rate","K=5","K=10","LOOCV"), c("12 variables","11 variables","7 variables","4 variables")))
+library(xtable)
+summary_svm <- as.data.frame(summary_svm)
+x.summary_svm <- xtable(summary_svm, caption = "Performance summary for support vector machine", digits = 4, align = c("c","c","c","c","c"))
+print(x.summary_svm,table.placement="H")
+```
+# Improved method (variable selection, imbalanced data)
+```{r}
+# Class weighted model performance metrics
+va <- c(2,6,9) # indices of variables selected
+set.seed(seed)
+svm_w_vi2 <- best.svm(test~., data = driver_scw[,va], scale=TRUE, kernel="radial",
+             gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)),probability = TRUE, 
+             class.weights= c("0" = 1, "1" = 3))
+yHe <- driver_scw$test
+table(predict(svm_w_vi2, driver_scw[,va]), yHe) 
+# Confusion matrix from LOO for the best model
+pre_wsvm_loo <- CVError_wsvm_loo(driver_scw[,va], 37,seed+320)
+table(as.factor(pre_wsvm_loo), driver_scw$test) 
+
+# training AUC
+psvm_w_vi2 <- attr(predict(svm_w_vi2, driver_scw[,va], probability = TRUE, 
+                           decision.values = TRUE), "decision.values")
+library(pROC)
+roc.svm_w_vi2 <- roc(yHe~as.vector(psvm_w_vi2), smooth = FALSE)
+auc(roc.svm_w_vi2) 
+# CV error
+CVEsvm_w_vi2 <- apply(sapply(see, FUN = function(s) sapply(k, FUN = function(x) CVError_svm_w(driver_scw[va], x, s))),1,mean)
+CVEsvm_w_vi2 
+# testing AUC (only try K =5)
+mean(sapply(see_red, FUN = function(s) CVAUC_svm_w(driver_scw[va], K=5, s)))
+
+
+###Different Variable Selection Methods#####
+# Highest testingAUC with bvtt
+aucmean <- numeric(13)
+for(i in c(2:5,7:13)) {
+  va <- c(1,6,i)
+  aucmean[i] <- mean(sapply(see_red, FUN = function(s) CVAUC_svm_w(driver_scw[va], K=5, s)))
+}
+which.max(aucmean) # choose cwt
+aucmean2 <- numeric(13)
+for(i in c(9:10)) {
+  va <- c(1,2,6,i)
+  aucmean2[i] <- mean(sapply(see_red, FUN = function(s) CVAUC_svm_w(driver_scw[va], K=5, s)))
+}
+which.max(aucmean2)
+
+
+# Change of Testing AUC (weighted svm)
+Cauc <- function(x) {
+ mean(sapply(see_red, FUN = function(s) CVAUC_svm(driver_scw[,-x], K=5, s)))
+}
+   # Round 1
+auc_all <- mean(sapply(see_red, FUN = function(s) CVAUC_svm(driver_scw, K=5, s))) #   0.732
+auc_result1 <- numeric(11) # index 2:12
+auc_result1 <- sapply(2:12, FUN = function(x) Cauc(x))
+# calculate which variable to remove(have greatest increase in auc)
+diff1 <- auc_result1 - auc_all
+remove1 <- which.max(diff1) # 5, index=6
+index <- order(diff1, decreasing = TRUE)
+names(driver_scw)[-1][index] #  "bvtd" "cccs" "bvtt" "cvtt" "rp3"  "cwt"  "rp2"  "cvtd" "sdo"  "jlo"  "ccds"
+   # Round 2
+auc_all2 <- auc_result1[remove1] # 0.7453333
+auc_result2 <- sapply(c(2:6,8:12), FUN = function(x) Cauc(c(remove1+1, x)))
+diff2 <- auc_result2 - auc_all2
+remove2 <- which.max(diff2) #
+index2 <- order(diff2, decreasing = TRUE)
+names(driver_scw)[-c(1,7)][index2] #  "bvtt" "cwt"  "cvtd" "cvtt" "rp2"  "sdo"  "rp3"  "jlo"  "cccs" "ccds"
+   # Round 3
+auc_all3 <- auc_result2[remove2] # 0.7380000
+auc_result3 <- sapply(c(2:5,8:12), FUN = function(x) Cauc(c(6,7, x)))
+diff3 <- auc_result3 - auc_all3
+remove3 <- which.max(diff3) #
+index3 <- order(diff3, decreasing = TRUE)
+names(driver_scw)[-c(1,6,7)][index3] # "rp2"  "sdo"  "cccs" "ccds" "cvtd" "jlo"  "rp3"  "cvtt" "cwt" 
+   # Round 4
+auc_all4 <- auc_result3[remove3] # 0.7986667
+auc_result4 <- sapply(c(2:5,8:9,11,12), FUN = function(x) Cauc(c(6,7,10, x)))
+diff4 <- auc_result4 - auc_all4
+remove4 <- which.max(diff4) #
+index4 <- order(diff4, decreasing = TRUE)
+names(driver_scw)[-c(1,6,7,10)][index4] # "sdo"  "rp3"  "ccds" "cccs" "cwt"  "cvtd" "jlo"  "cvtt"
+   # Round 5
+auc_all5 <- auc_result4[remove4] # 0.8046667
+auc_result5 <- sapply(c(2:5,9,11,12), FUN = function(x) Cauc(c(6,7,8,10, x)))
+diff5 <- auc_result5 - auc_all5
+remove5 <- which.max(diff5) #
+index5 <- order(diff5, decreasing = TRUE)
+names(driver_scw)[-c(1,6,7,8,10)][index5] # "cccs" "rp3"  "ccds" "cwt"  "cvtd" "jlo"  "cvtt"
+  # Round 6
+auc_all6 <- auc_result5[remove5] # 0.8306667
+auc_result6 <- sapply(c(2:5,9,12), FUN = function(x) Cauc(c(6,7,8,10,11, x)))
+diff6 <- auc_result6 - auc_all6
+remove6 <- which.max(diff6) #
+index6 <- order(diff6, decreasing = TRUE)
+names(driver_scw)[-c(1,6,7,8,10,11)][index6]  #"rp3"  "ccds" "cvtd" "cwt"  "jlo"  "cvtt"
+  # Round 7
+auc_all7 <- auc_result6[remove6] # 0.8513333
+auc_result7 <- sapply(c(2:5,12), FUN = function(x) Cauc(c(6:11, x)))
+diff7 <- auc_result7 - auc_all7
+remove7 <- which.max(diff7) #
+index7 <- order(diff7, decreasing = TRUE)
+names(driver_scw)[-c(1,6:11)][index7]  # "cvtd" "cwt"  "jlo"  "ccds" "cvtt"
+  # Round 8
+auc_all8 <- auc_result7[remove7] # 0.8513333
+auc_result8 <- sapply(c(2:4,12), FUN = function(x) Cauc(c(5:11, x))) # end
+```
+
+```{r}
+vi2_svm <- c(1.000,0.7900,0.0000,0.2626,0.2117,0.2324)
+vi3_svm <- c(0.5603,0.7867,0.2162,0.2130,0.2067,0.2162)
+split2_svm <- c(0.7328,0.7633,0.2162,0.2130,0.2067,0.2162)
+split3_svm <- c(0.8922,0.7800,0.1892,0.2127,0.2135,0.2188)
+logit_svm <- c(0.8125,0.6950,0.1622,0.2310,0.2298,0.2407)
+testauc <- c(0.5086,0.8147,0.2162,0.2130,0.2067,0.2162)
+bvtt2_svm <- c(0.987,0.7987,0.0540,0.2063,0.1976,0.2046)
+bvtt3_svm <- c(0.9526,0.8240,0.0811,0.1950,0.1905,0.1866)
+
+summary_svm_improve <- matrix(c(vi2_svm, vi3_svm, split2_svm, split3_svm, logit_svm, testauc, bvtt2_svm, bvtt3_svm), ncol= 8, byrow = FALSE, dimnames = list(c("Training AUC","Testing AUC", "Misclassification Rate","K=5","K=10","LOOCV"), c("VI(2)","VI(3)","Tree Splits(2)","Tree Splits(3)","logistic variables","Change of AUC","With bvtt(2)","With bvtt(3)")))
+library(xtable)
+summary_svm_improve <- as.data.frame(summary_svm_improve)
+x.summary_svm_improve <- xtable(summary_svm_improve, caption = "Performance summary for weighted SVM with different variable selection methods", digits = 4, align = c("c","c","c","c","c","c","c","c","c"))
+print(x.summary_svm_improve,table.placement="H")
+```
+
+
+# desicion boundary_SVM
+```{r}
+# choose the best model: cwt + bvtt
+make.grid=function(x,n=75){
+  grange=apply(x,2,range)
+  x1=seq(from=grange[1,1],to=grange[2,1],length=n)
+  x2=seq(from=grange[1,2],to=grange[2,2],length=n)
+  expand.grid(X1=x1,X2=x2)
+}
+va <- c(1,2,6)
+set.seed(seed)
+library(e1071)
+svm_plot <- best.svm(test~., data = driver_scw[,va], scale=TRUE, kernel="radial",
+                     gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)),probability = TRUE, 
+                     class.weights= c("0" = 1, "1" = 3))
+xgrid <- make.grid(driver_scw[,c(2,6)])
+colnames(xgrid) <- c("cwt","bvtt")
+ygrid <- predict(svm_plot,xgrid)
+func <- predict(svm_plot, xgrid, decision.values=TRUE)
+func <- attributes(func)$decision
+grange <- apply(driver_scw[,c(2,6)], 2, range)
+cwt_range <- seq(from = grange[1,1], to = grange[2,1], length = 75)
+bvtt_range <- seq(from = grange[1,2], to = grange[2,2], length = 75)
+par(mfrow=c(1,1))
+plot(xgrid,col=as.numeric(ygrid),pch=20,cex=.2, main="Desicion boundary for SVM model(bvtt + cwt)", xlab="Variable_cwt", ylab="Variable_bvtt")
+points(driver_scw[,c(2,6)], col = as.numeric(driver_scw$test), pch = 19, cex = 0.7)
+contour(cwt_range, bvtt_range, matrix(func, 75, 75), level = 0, add = TRUE, col = "blue")
+
+legend("bottomright", pch = c(20,20,1), col = c(1,2, 4), legend = c("Pass (control)","Fail (case)","Decision Boundary"), cex = 0.9)
+
+
+# 3 Variables
+driver_scw[,c(1,2,6,9)]
+make.grid2 <- function(x,n=75){
+  grange=apply(x,2,range)
+  x1=seq(from=grange[1,1],to=grange[2,1],length=n)
+  x2=seq(from=grange[1,2],to=grange[2,2],length=n)
+  x3=seq(from=grange[1,3],to=grange[2,3],length=n)
+  expand.grid(X1=x1,X2=x2,X3=x3)
+}
+va<- c(1,2,6,9)
+
+library(e1071)
+set.seed(seed)
+svm_plot2 <- best.svm(test~., data = driver_scw[,va], scale=TRUE, kernel="radial",
+                     gamma = 2^(seq(-15,15,3)), cost = 2^(seq(-5,15,2)),probability = TRUE, 
+                     class.weights= c("0" = 1, "1" = 3))
+xgrid2 <- make.grid2(driver_scw[,c(2,6,9)])
+colnames(xgrid2) <- c("cwt","bvtt","rp3")
+ygrid2 <- predict(svm_plot2,xgrid2)
+func2 <- predict(svm_plot2, xgrid2, decision.values=TRUE)
+func2 <- attributes(func2)$decision
+grange2 <- apply(driver_scw[,c(2,6,9)], 2, range)
+cwt_range <- seq(from = grange2[1,1], to = grange2[2,1], length = 75)
+bvtt_range <- seq(from = grange2[1,2], to = grange2[2,2], length = 75)
+rp3_range <- seq(from = 2, to = 53, length = 75)
+newarr <- array(func2, dim=rep(75, 3))
+par(mfrow=c(1,1))
+library(rgl)
+library(misc3d)
+plot3d(driver_scw[,c(2,6,9)], col = as.numeric(driver_scw$test), pch = 5, size = 7, xlab="Variable_cwt", ylab="Variable_bvtt", zlab = "Variable_rp3")
+contour3d(newarr,level=0, x=cwt_range, y=bvtt_range, z=rp3_range, add=T, alpha = .3)
+legend3d("topright", pch = 20, col = c("black","red","grey"), legend = c("Pass (control)","Fail (case)","Decision Boundary"), cex = 3)
+snapshot3d(filename = '3dplot.png', fmt = 'png')
+```
